@@ -1,56 +1,139 @@
 # EdgeInfer
 
-A PyTorch pipeline demonstrating **post-training quantization** of a small transformer model for **edge inference** — benchmarking latency and accuracy tradeoff on CPU-only hardware.
+EdgeInfer is a CPU-first benchmarking tool for small text classifiers, focused on the kinds of model compression tradeoffs that matter for edge deployment.
+
+It now does more than print a toy before/after comparison:
+
+- trains a compact transformer before benchmarking, so accuracy is meaningful
+- benchmarks multiple deployment variants: `fp32`, `dynamic_int8`, and `dynamic_float16`
+- saves JSON and CSV reports for each run
+- supports either a built-in learnable dataset or a user-provided JSONL text dataset
+- requires explicit `--simulate` mode when PyTorch is unavailable, so fake metrics are clearly labeled
 
 ## Motivation
 
-Deploying AI in bandwidth-limited, power-constrained environments (edge devices, drone platforms, embedded hardware) requires models that are fast, small, and accurate. This project demonstrates the quantization workflow used to prepare models for edge deployment.
+Deploying AI in bandwidth-limited, power-constrained environments requires models that are fast, small, and still accurate enough to trust. EdgeInfer is meant to show the workflow engineers use to compare baseline and optimized model variants before shipping to CPU-bound devices.
 
 ## What It Does
 
-1. Builds a small transformer encoder classifier (FP32)
-2. Benchmarks baseline latency and memory footprint
-3. Applies **dynamic INT8 quantization** (`torch.quantization.quantize_dynamic`)
-4. Re-benchmarks the quantized model
-5. Reports speedup, size reduction, and accuracy delta
+1. Builds and trains a small transformer text classifier
+2. Evaluates baseline FP32 accuracy
+3. Benchmarks repeated CPU inference with warmup runs
+4. Applies dynamic quantization variants
+5. Re-benchmarks latency, throughput, model size, and accuracy deltas
+6. Writes machine-readable JSON and CSV artifacts to `reports/`
 
-## Usage
+## Installation
 
 ```bash
 pip install torch
+```
+
+## Usage
+
+Run the default built-in dataset benchmark:
+
+```bash
 python edge_infer.py
 ```
 
-## Example Output
+Run a clearly labeled demo without PyTorch:
 
+```bash
+python edge_infer.py --simulate
 ```
-[ FP32 model ]
-  Size:     0.54 MB
-  Latency:  4.2 ms mean, 5.1 ms p95
 
-[ INT8 quantized model ]
-  Size:     0.18 MB
-  Latency:  1.9 ms mean, 2.3 ms p95
+Benchmark only FP32 and INT8:
 
-[ Summary ]
-  Speedup:        2.2x faster inference
-  Size reduction: 66.7%
-  Accuracy delta: 0.001
+```bash
+python edge_infer.py --variants fp32 dynamic_int8
 ```
+
+Tune the experiment:
+
+```bash
+python edge_infer.py \
+  --train-epochs 4 \
+  --seq-len 48 \
+  --batch-size 2 \
+  --n-runs 75 \
+  --warmup-runs 15
+```
+
+Use a local JSONL dataset:
+
+```bash
+python edge_infer.py --dataset-jsonl data/reviews.jsonl
+```
+
+Expected JSONL format:
+
+```json
+{"text": "battery lasts all day", "label": 1}
+{"text": "screen flickers after boot", "label": 0}
+```
+
+## Output Artifacts
+
+Each run writes:
+
+- `reports/edgeinfer_<timestamp>.json`
+- `reports/edgeinfer_<timestamp>.csv`
+
+The report includes:
+
+- runtime mode (`benchmark` or `simulation`)
+- system metadata
+- config values
+- dataset summary
+- training history
+- per-variant latency, throughput, size, and accuracy
+- comparison summaries versus FP32
+
+## Example Console Flow
+
+```text
+=== EdgeInfer: Quantization & Edge Inference Benchmark ===
+
+[ Dataset ] keyword_signal
+  Train examples: 512
+  Eval examples:  128
+
+[ Training ]
+  Epoch 1: loss=0.4120 eval_acc=92.2%
+  Epoch 2: loss=0.1337 eval_acc=98.4%
+  Epoch 3: loss=0.0518 eval_acc=99.2%
+
+[ fp32 ]
+  Size:     0.56 MB
+  Latency:  4.31 ms mean, 4.07 ms median, 5.14 ms p95
+  Throughput: 231.92 samples/s
+  Accuracy: 99.2%
+```
+
+## Useful Flags
+
+- `--simulate`: run demo metrics intentionally and transparently
+- `--dataset-jsonl PATH`: benchmark on a local labeled text dataset
+- `--variants ...`: choose which deployment variants to compare
+- `--output-dir DIR`: choose where reports are saved
+- `--skip-report`: skip writing JSON/CSV artifacts
+- `--embed-dim`, `--num-heads`, `--num-layers`, `--ff-dim`: adjust model size
 
 ## Extending
 
-- Swap the toy model for a real fine-tuned checkpoint (e.g. DistilBERT, TinyLlama)
-- Add static quantization with calibration dataset for better accuracy preservation
-- Export to ONNX for hardware-agnostic deployment
-- Add pruning to further reduce model size before quantization
+- Add static post-training quantization with a calibration split
+- Support ONNX export for hardware-agnostic deployment
+- Swap the local tokenizer/model for a real fine-tuned checkpoint
+- Add pruning or sparsity-aware comparisons
+- Add CI or dashboards to compare benchmark history across runs
 
 ## Tech Stack
 
 - Python 3.11+
-- PyTorch (quantization module)
-- No GPU required — benchmarks on CPU to simulate edge hardware
+- PyTorch
+- CPU-only benchmarking
 
 ## Relevance
 
-Built as a portfolio project aligned with Tyto Athene's TALON lab work on edge AI deployment for DoD environments.
+This project is aligned with edge AI and model optimization work where deployment constraints matter as much as raw model quality.
