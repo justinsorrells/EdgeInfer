@@ -6,8 +6,9 @@ It now does more than print a toy before/after comparison:
 
 - trains a compact transformer before benchmarking, so quality metrics are meaningful
 - uses separate train, calibration, validation, and test splits
-- benchmarks multiple deployment variants: `fp32`, `dynamic_int8`, and `dynamic_float16`
+- benchmarks multiple deployment variants: `fp32`, `dynamic_int8`, `dynamic_float16`, and `static_int8`
 - reports accuracy, macro F1, weighted F1, balanced accuracy, and confusion matrices
+- can export and benchmark ONNX runtimes from selected variants
 - saves JSON and CSV reports for each run
 - compares saved runs and shows local report history
 - requires explicit `--simulate` mode when PyTorch is unavailable, so fake metrics are clearly labeled
@@ -22,15 +23,16 @@ Deploying AI in bandwidth-limited, power-constrained environments requires model
 2. Splits data into train, calibration, validation, and test sets
 3. Evaluates validation metrics during training
 4. Benchmarks repeated CPU inference with warmup runs
-5. Applies dynamic quantization variants
+5. Applies dynamic and static quantization variants
 6. Re-benchmarks latency, throughput, size, and held-out test metrics
-7. Writes machine-readable JSON and CSV artifacts to `reports/`
-8. Compares past benchmark runs with built-in CLI commands
+7. Optionally exports variants to ONNX and benchmarks the exported runtime
+8. Writes machine-readable JSON and CSV artifacts to `reports/`
+9. Compares past benchmark runs with built-in CLI commands
 
 ## Installation
 
 ```bash
-pip install torch
+pip install torch onnxruntime onnxscript
 ```
 
 ## Benchmark Usage
@@ -47,10 +49,16 @@ Run a clearly labeled demo without PyTorch:
 python edge_infer.py --simulate
 ```
 
-Benchmark only FP32 and INT8:
+Benchmark only FP32 and dynamic INT8:
 
 ```bash
 python edge_infer.py --variants fp32 dynamic_int8
+```
+
+Include static quantization in the run:
+
+```bash
+python edge_infer.py --variants fp32 dynamic_int8 static_int8
 ```
 
 Tune the experiment:
@@ -70,6 +78,14 @@ Use a local JSONL dataset:
 python edge_infer.py --dataset-jsonl data/reviews.jsonl
 ```
 
+Export and benchmark the FP32 ONNX runtime:
+
+```bash
+python edge_infer.py --export-formats onnx
+```
+
+Current ONNX export support is limited to the eager `fp32` variant for this transformer benchmark. Quantized variants are still benchmarked in-process, but are not exported to ONNX by this CLI yet.
+
 Expected JSONL format:
 
 ```json
@@ -83,6 +99,14 @@ Compare the latest two saved benchmark runs:
 
 ```bash
 python edge_infer.py compare --latest
+```
+
+Fail CI if latency regresses by more than 10% or macro F1 drops by more than 0.01:
+
+```bash
+python edge_infer.py compare --latest \
+  --max-latency-regression-pct 10 \
+  --max-macro-f1-drop 0.01
 ```
 
 Compare two explicit report files:
@@ -105,6 +129,7 @@ Each benchmark run writes:
 
 - `reports/edgeinfer_<timestamp>.json`
 - `reports/edgeinfer_<timestamp>.csv`
+- `reports/edgeinfer_export_<timestamp>_<variant>.onnx` when ONNX export is requested
 
 Each comparison run writes:
 
@@ -118,6 +143,7 @@ Benchmark reports include:
 - dataset summary and split counts
 - training history
 - per-variant latency, throughput, size, and quality metrics
+- optional export/runtime benchmark entries
 - confusion matrices and per-class scores
 - comparison summaries versus FP32
 
@@ -151,17 +177,19 @@ Benchmark reports include:
 - `--calibration-ratio`, `--validation-ratio`, `--test-ratio`: JSONL split controls
 - `--calibration-samples`, `--validation-samples`, `--test-samples`: built-in dataset split sizes
 - `--variants ...`: choose which deployment variants to compare
+- `--export-formats onnx`: export and benchmark ONNX runtimes
+- `--export-variants ...`: choose which eager variants to export
+- `--export-opset`: select the ONNX opset version
 - `--output-dir DIR`: choose where reports are saved
 - `--skip-report`: skip writing JSON/CSV artifacts
 - `--embed-dim`, `--num-heads`, `--num-layers`, `--ff-dim`: adjust model size
 
 ## Extending
 
-- Add static post-training quantization using the new calibration split
-- Support ONNX export for hardware-agnostic deployment
+- Expand ONNX support to additional providers and quantized export paths
 - Swap the local tokenizer/model for a real fine-tuned checkpoint
 - Add pruning or sparsity-aware comparisons
-- Add CI regression thresholds for benchmark artifacts
+- Wire compare thresholds into CI regression checks
 
 ## Tech Stack
 

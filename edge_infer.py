@@ -9,6 +9,7 @@ import csv
 import io
 import json
 import math
+import operator
 import platform
 import random
 import re
@@ -16,6 +17,7 @@ import statistics
 import sys
 import time
 from collections import Counter
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,9 +40,21 @@ except ImportError:
     TORCH_AVAILABLE = False
     TORCH_VERSION = None
 
+try:
+    import onnxruntime as ort
+
+    ONNXRUNTIME_AVAILABLE = True
+    ONNXRUNTIME_VERSION = ort.__version__
+except ImportError:
+    ort = None
+    ONNXRUNTIME_AVAILABLE = False
+    ONNXRUNTIME_VERSION = None
+
 PAD_TOKEN_ID = 0
 UNK_TOKEN_ID = 1
-DEFAULT_VARIANTS = ("fp32", "dynamic_int8", "dynamic_float16")
+DEFAULT_VARIANTS = ("fp32", "dynamic_int8", "dynamic_float16", "static_int8")
+EXPORT_FORMATS = ("onnx",)
+ONNX_SUPPORTED_EXPORT_VARIANTS = ("fp32",)
 DEFAULT_COMMAND = "benchmark"
 
 
@@ -72,7 +86,11 @@ class SmallTextClassifier(nn.Module if TORCH_AVAILABLE else object):
                 dropout=0.0,
                 batch_first=True,
             )
-            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=num_layers,
+                enable_nested_tensor=False,
+            )
             self.classifier = nn.Linear(embed_dim, num_classes)
             self.pad_token_id = pad_token_id
 
@@ -380,13 +398,107 @@ def safe_divide(numerator: float, denominator: float) -> float:
     return numerator / denominator if denominator else 0.0
 
 
+def build_timing_metrics(
+    latencies_ms: list[float],
+    batch_size: int,
+    token_count: int,
+    n_runs: int,
+    warmup_runs: int,
+) -> dict:
+    sorted_latencies = sorted(latencies_ms)
+    mean_ms = statistics.mean(latencies_ms)
+    return {
+        "mean_ms": round(mean_ms, 3),
+        "median_ms": round(statistics.median(latencies_ms), 3),
+        "stddev_ms": round(statistics.pstdev(latencies_ms), 3),
+        "p95_ms": round(percentile(sorted_latencies, 95), 3),
+        "samples_per_sec": round((batch_size * 1000) / max(mean_ms, 1e-9), 2),
+        "tokens_per_sec": round((token_count * 1000) / max(mean_ms, 1e-9), 2),
+        "n_runs": n_runs,
+        "warmup_runs": warmup_runs,
+    }
+
+
+def select_quantized_engine() -> str:
+    supported_engines = list(getattr(torch.backends.quantized, "supported_engines", []))
+    for candidate in ("x86", "fbgemm", "qnnpack"):
+        if candidate in supported_engines:
+            return candidate
+
+    current_engine = getattr(torch.backends.quantized, "engine", "")
+    if current_engine and str(current_engine).lower() not in {"none", "noqengine"}:
+        return current_engine
+    raise RuntimeError("No supported quantized backend found for static quantization.")
+
+
+def has_restorable_quantized_engine(engine) -> bool:
+    return engine is not None and str(engine).lower() not in {"none", "noqengine", ""}
+
+
+@contextmanager
+def quantized_engine_context(engine: str | None):
+    original_engine = getattr(torch.backends.quantized, "engine", None) if TORCH_AVAILABLE else None
+    try:
+        if TORCH_AVAILABLE and engine:
+            torch.backends.quantized.engine = engine
+        yield
+    finally:
+        if TORCH_AVAILABLE and has_restorable_quantized_engine(original_engine):
+            torch.backends.quantized.engine = original_engine
+
+
+@contextmanager
+def mha_fastpath_context(disabled: bool):
+    if not TORCH_AVAILABLE or not hasattr(torch.backends, "mha") or not hasattr(torch.backends.mha, "get_fastpath_enabled"):
+        yield
+        return
+
+    original_state = torch.backends.mha.get_fastpath_enabled()
+    try:
+        if disabled:
+            torch.backends.mha.set_fastpath_enabled(False)
+        yield
+    finally:
+        torch.backends.mha.set_fastpath_enabled(original_state)
+
+
+def calibrate_model(model, calibration_dataset, batch_size: int):
+    calibration_inputs, calibration_labels = calibration_dataset
+    if len(calibration_labels) < 1:
+        raise RuntimeError("Static quantization needs at least one calibration example.")
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_inputs, _ in iterate_batches(
+            calibration_inputs,
+            calibration_labels,
+            batch_size=batch_size,
+            shuffle=False,
+            seed=0,
+        ):
+            _ = model(batch_inputs)
+
+
+def build_static_qconfig_mapping(backend: str):
+    """
+    Skip observers on bool- and shape-only ops used for padding masks.
+    FX static quantization otherwise tries to histogram a bool tensor, which fails
+    during calibration on the transformer masking path.
+    """
+    qconfig_mapping = torch_quantization.get_default_qconfig_mapping(backend)
+    for method_name in ("eq", "unsqueeze", "float", "sum", "clamp"):
+        qconfig_mapping = qconfig_mapping.set_object_type(method_name, None)
+    return qconfig_mapping.set_object_type(operator.invert, None)
+
+
 def model_size_mb(model) -> float | None:
     """Estimate serialized model size in MB via state_dict bytes."""
     if not TORCH_AVAILABLE:
         return None
 
     buffer = io.BytesIO()
-    torch.save(model.state_dict(), buffer)
+    with quantized_engine_context(getattr(model, "_edgeinfer_quantized_engine", None)):
+        torch.save(model.state_dict(), buffer)
     return len(buffer.getbuffer()) / (1024 ** 2)
 
 
@@ -395,28 +507,24 @@ def benchmark_inference(model, inputs, n_runs: int = 50, warmup_runs: int = 10) 
     model.eval()
     latencies = []
 
-    with torch.inference_mode():
-        for _ in range(warmup_runs):
-            _ = model(inputs)
+    with quantized_engine_context(getattr(model, "_edgeinfer_quantized_engine", None)):
+        with mha_fastpath_context(getattr(model, "_edgeinfer_disable_mha_fastpath", False)):
+            with torch.inference_mode():
+                for _ in range(warmup_runs):
+                    _ = model(inputs)
 
-        for _ in range(n_runs):
-            start = time.perf_counter()
-            _ = model(inputs)
-            latencies.append((time.perf_counter() - start) * 1000)
+                for _ in range(n_runs):
+                    start = time.perf_counter()
+                    _ = model(inputs)
+                    latencies.append((time.perf_counter() - start) * 1000)
 
-    sorted_latencies = sorted(latencies)
-    mean_ms = statistics.mean(latencies)
-
-    return {
-        "mean_ms": round(mean_ms, 3),
-        "median_ms": round(statistics.median(latencies), 3),
-        "stddev_ms": round(statistics.pstdev(latencies), 3),
-        "p95_ms": round(percentile(sorted_latencies, 95), 3),
-        "samples_per_sec": round((inputs.size(0) * 1000) / max(mean_ms, 1e-9), 2),
-        "tokens_per_sec": round((inputs.numel() * 1000) / max(mean_ms, 1e-9), 2),
-        "n_runs": n_runs,
-        "warmup_runs": warmup_runs,
-    }
+    return build_timing_metrics(
+        latencies_ms=latencies,
+        batch_size=inputs.size(0),
+        token_count=inputs.numel(),
+        n_runs=n_runs,
+        warmup_runs=warmup_runs,
+    )
 
 
 def collect_predictions(model, dataset, batch_size: int = 32) -> tuple[list[int], list[int]]:
@@ -425,17 +533,19 @@ def collect_predictions(model, dataset, batch_size: int = 32) -> tuple[list[int]
     targets = []
 
     model.eval()
-    with torch.inference_mode():
-        for batch_inputs, batch_labels in iterate_batches(
-            inputs,
-            labels,
-            batch_size=batch_size,
-            shuffle=False,
-            seed=0,
-        ):
-            logits = model(batch_inputs)
-            predictions.extend(logits.argmax(dim=-1).cpu().tolist())
-            targets.extend(batch_labels.cpu().tolist())
+    with quantized_engine_context(getattr(model, "_edgeinfer_quantized_engine", None)):
+        with mha_fastpath_context(getattr(model, "_edgeinfer_disable_mha_fastpath", False)):
+            with torch.inference_mode():
+                for batch_inputs, batch_labels in iterate_batches(
+                    inputs,
+                    labels,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    seed=0,
+                ):
+                    logits = model(batch_inputs)
+                    predictions.extend(logits.argmax(dim=-1).cpu().tolist())
+                    targets.extend(batch_labels.cpu().tolist())
 
     return targets, predictions
 
@@ -579,21 +689,188 @@ def apply_dynamic_quantization(model, variant_name: str):
         "dynamic_float16": torch.float16,
     }
     dtype = dtype_lookup[variant_name]
-    return torch_quantization.quantize_dynamic(model, {nn.Linear}, dtype=dtype)
+    original_engine = getattr(torch.backends.quantized, "engine", None)
+    selected_engine = select_quantized_engine()
+    try:
+        if has_restorable_quantized_engine(original_engine) or selected_engine:
+            torch.backends.quantized.engine = selected_engine
+        quantized_model = torch_quantization.quantize_dynamic(model, {nn.Linear}, dtype=dtype)
+        setattr(quantized_model, "_edgeinfer_quantized_engine", selected_engine)
+        setattr(quantized_model, "_edgeinfer_disable_mha_fastpath", True)
+        return quantized_model
+    except Exception as exc:
+        raise RuntimeError(
+            f"Dynamic quantization failed with engine '{selected_engine}': {exc}"
+        ) from exc
+    finally:
+        if has_restorable_quantized_engine(original_engine):
+            torch.backends.quantized.engine = original_engine
 
 
-def build_variant_model(model, variant_name: str):
+def apply_static_quantization(model, calibration_dataset, batch_size: int):
+    """Apply post-training static quantization using the calibration split."""
+    backend = select_quantized_engine()
+    original_engine = getattr(torch.backends.quantized, "engine", None)
+
+    try:
+        if has_restorable_quantized_engine(original_engine) or backend:
+            torch.backends.quantized.engine = backend
+
+        if not hasattr(torch_quantization, "get_default_qconfig_mapping"):
+            raise RuntimeError("Installed PyTorch build does not expose static FX qconfig mappings.")
+
+        try:
+            from torch.ao.quantization.quantize_fx import prepare_fx, convert_fx
+        except ImportError as exc:
+            raise RuntimeError("Static FX quantization is unavailable in this PyTorch build.") from exc
+
+        calibration_inputs, _ = calibration_dataset
+        example_inputs = (calibration_inputs[:1],)
+        qconfig_mapping = build_static_qconfig_mapping(backend)
+        prepared = prepare_fx(deepcopy(model).eval(), qconfig_mapping, example_inputs)
+        calibrate_model(prepared, calibration_dataset, batch_size=batch_size)
+        converted = convert_fx(prepared)
+        setattr(converted, "_edgeinfer_quantized_engine", backend)
+        setattr(converted, "_edgeinfer_disable_mha_fastpath", True)
+        return converted
+    except Exception as exc:
+        raise RuntimeError(f"Static quantization failed: {exc}") from exc
+    finally:
+        if has_restorable_quantized_engine(original_engine):
+            torch.backends.quantized.engine = original_engine
+
+
+def build_variant_model(model, variant_name: str, calibration_dataset=None, calibration_batch_size: int = 32):
     if variant_name == "fp32":
         return deepcopy(model)
     if variant_name in {"dynamic_int8", "dynamic_float16"}:
         return apply_dynamic_quantization(deepcopy(model), variant_name)
+    if variant_name == "static_int8":
+        if calibration_dataset is None:
+            raise ValueError("Static quantization requires a calibration dataset.")
+        return apply_static_quantization(
+            deepcopy(model),
+            calibration_dataset=calibration_dataset,
+            batch_size=calibration_batch_size,
+        )
     raise ValueError(f"Unsupported variant: {variant_name}")
+
+
+def export_model_to_onnx(
+    model,
+    sample_inputs,
+    output_dir: str,
+    variant_name: str,
+    export_opset: int,
+) -> str:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    artifact_path = output_path / f"edgeinfer_export_{unique_timestamp_token()}_{variant_name}.onnx"
+
+    model.eval()
+    with mha_fastpath_context(True):
+        with torch.inference_mode():
+            torch.onnx.export(
+                model,
+                sample_inputs,
+                str(artifact_path),
+                input_names=["input_ids"],
+                output_names=["logits"],
+                opset_version=export_opset,
+                dynamo=False,
+            )
+
+    return str(artifact_path.resolve())
+
+
+def validate_export_variant_support(format_name: str, source_variant: str):
+    if format_name == "onnx" and source_variant not in ONNX_SUPPORTED_EXPORT_VARIANTS:
+        supported_text = ", ".join(ONNX_SUPPORTED_EXPORT_VARIANTS)
+        raise RuntimeError(
+            "ONNX export currently supports only these eager variants for this transformer benchmark: "
+            f"{supported_text}. Requested: {source_variant}."
+        )
+
+
+def benchmark_onnx_runtime(onnx_path: str, inputs, n_runs: int, warmup_runs: int) -> dict:
+    if not ONNXRUNTIME_AVAILABLE:
+        raise RuntimeError("onnxruntime is not installed.")
+
+    session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+    numpy_inputs = inputs.cpu().numpy()
+    latencies = []
+
+    for _ in range(warmup_runs):
+        session.run(None, {input_name: numpy_inputs})
+
+    for _ in range(n_runs):
+        start = time.perf_counter()
+        session.run(None, {input_name: numpy_inputs})
+        latencies.append((time.perf_counter() - start) * 1000)
+
+    return build_timing_metrics(
+        latencies_ms=latencies,
+        batch_size=int(numpy_inputs.shape[0]),
+        token_count=int(numpy_inputs.size),
+        n_runs=n_runs,
+        warmup_runs=warmup_runs,
+    )
+
+
+def collect_onnx_predictions(onnx_path: str, dataset, batch_size: int = 32) -> tuple[list[int], list[int]]:
+    if not ONNXRUNTIME_AVAILABLE:
+        raise RuntimeError("onnxruntime is not installed.")
+
+    session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+    inputs, labels = dataset
+    predictions = []
+    targets = []
+
+    for batch_inputs, batch_labels in iterate_batches(
+        inputs,
+        labels,
+        batch_size=batch_size,
+        shuffle=False,
+        seed=0,
+    ):
+        logits = session.run(None, {input_name: batch_inputs.cpu().numpy()})[0]
+        predictions.extend(logits.argmax(axis=-1).tolist())
+        targets.extend(batch_labels.cpu().tolist())
+
+    return targets, predictions
 
 
 def build_result_record(name: str, size_mb, inference_metrics: dict, evaluation_metrics: dict) -> dict:
     return {
         "name": name,
         "size_mb": None if size_mb is None else round(size_mb, 3),
+        **inference_metrics,
+        "accuracy": evaluation_metrics["accuracy"],
+        "macro_precision": evaluation_metrics["macro_precision"],
+        "macro_recall": evaluation_metrics["macro_recall"],
+        "macro_f1": evaluation_metrics["macro_f1"],
+        "weighted_f1": evaluation_metrics["weighted_f1"],
+        "balanced_accuracy": evaluation_metrics["balanced_accuracy"],
+        "metrics": evaluation_metrics,
+    }
+
+
+def build_export_result(
+    format_name: str,
+    source_variant: str,
+    artifact_path: str | None,
+    inference_metrics: dict,
+    evaluation_metrics: dict,
+    simulated: bool,
+) -> dict:
+    return {
+        "name": f"{format_name}:{source_variant}",
+        "format": format_name,
+        "source_variant": source_variant,
+        "artifact_path": artifact_path,
+        "simulated": simulated,
         **inference_metrics,
         "accuracy": evaluation_metrics["accuracy"],
         "macro_precision": evaluation_metrics["macro_precision"],
@@ -644,6 +921,8 @@ def build_system_info() -> dict:
         "processor": platform.processor() or "unknown",
         "torch_available": TORCH_AVAILABLE,
         "torch_version": TORCH_VERSION,
+        "onnxruntime_available": ONNXRUNTIME_AVAILABLE,
+        "onnxruntime_version": ONNXRUNTIME_VERSION,
     }
 
 
@@ -684,6 +963,51 @@ def simulated_metrics_from_accuracy(accuracy: float, index_to_label: list[str], 
     return compute_classification_metrics(targets, predictions, index_to_label=index_to_label)
 
 
+def build_simulated_export_results(args, benchmark_results: list[dict]) -> tuple[list[dict], list[dict]]:
+    rng = random.Random(args.seed + 10_000)
+    exports = []
+    export_errors = []
+    results_by_name = {result["name"]: result for result in benchmark_results}
+
+    for format_name in args.export_formats:
+        for source_variant in args.export_variants:
+            source_result = results_by_name.get(source_variant)
+            if source_result is None:
+                export_errors.append(
+                    {
+                        "format": format_name,
+                        "source_variant": source_variant,
+                        "error": "Source variant was not benchmarked successfully.",
+                    }
+                )
+                continue
+
+            mean_ms = source_result["mean_ms"] * rng.uniform(0.82, 0.96)
+            inference_metrics = {
+                "mean_ms": round(mean_ms, 3),
+                "median_ms": round(mean_ms * 0.98, 3),
+                "stddev_ms": round(mean_ms * 0.04, 3),
+                "p95_ms": round(mean_ms * 1.15, 3),
+                "samples_per_sec": round((args.batch_size * 1000) / mean_ms, 2),
+                "tokens_per_sec": round((args.batch_size * args.seq_len * 1000) / mean_ms, 2),
+                "n_runs": args.n_runs,
+                "warmup_runs": args.warmup_runs,
+            }
+            evaluation_metrics = source_result["metrics"]
+            exports.append(
+                build_export_result(
+                    format_name=format_name,
+                    source_variant=source_variant,
+                    artifact_path=None,
+                    inference_metrics=inference_metrics,
+                    evaluation_metrics=evaluation_metrics,
+                    simulated=True,
+                )
+            )
+
+    return exports, export_errors
+
+
 def build_simulation_report(args) -> dict:
     print("=== EdgeInfer: Simulation Mode ===\n")
     print("[warn] No real PyTorch execution happened. Metrics below are labeled demo values.\n")
@@ -704,6 +1028,10 @@ def build_simulation_report(args) -> dict:
             size_mb = round(base_size * rng.uniform(0.32, 0.42), 3)
             mean_ms = base_latency * rng.uniform(0.5, 0.7)
             accuracy = max(base_accuracy - rng.uniform(0.0, 0.01), 0.0)
+        elif variant_name == "static_int8":
+            size_mb = round(base_size * rng.uniform(0.28, 0.38), 3)
+            mean_ms = base_latency * rng.uniform(0.45, 0.62)
+            accuracy = max(base_accuracy - rng.uniform(0.0, 0.015), 0.0)
         else:
             size_mb = round(base_size * rng.uniform(0.55, 0.7), 3)
             mean_ms = base_latency * rng.uniform(0.78, 0.92)
@@ -724,6 +1052,7 @@ def build_simulation_report(args) -> dict:
         results.append(result)
         print_variant_summary(result)
 
+    exports, export_errors = build_simulated_export_results(args, results)
     return {
         "mode": "simulation",
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -744,8 +1073,10 @@ def build_simulation_report(args) -> dict:
         },
         "training": {"executed": False},
         "results": results,
+        "exports": exports,
         "summary": summarize_results(results),
         "variant_errors": [],
+        "export_errors": export_errors,
     }
 
 
@@ -782,6 +1113,20 @@ def print_variant_summary(result: dict):
     print(
         f"  Quality:  acc={result['accuracy']:.1%}, "
         f"macro_f1={result['macro_f1']:.1%}, weighted_f1={result['weighted_f1']:.1%}\n"
+    )
+
+
+def print_export_summary(export_result: dict):
+    print(f"[ export {export_result['format']} from {export_result['source_variant']} ]")
+    artifact_text = export_result["artifact_path"] or "simulation-only"
+    print(f"  Artifact:  {artifact_text}")
+    print(
+        f"  Runtime:   {export_result['mean_ms']:.2f} ms mean, "
+        f"{export_result['median_ms']:.2f} ms median, {export_result['p95_ms']:.2f} ms p95"
+    )
+    print(
+        f"  Quality:   acc={export_result['accuracy']:.1%}, "
+        f"macro_f1={export_result['macro_f1']:.1%}\n"
     )
 
 
@@ -841,6 +1186,83 @@ def write_report_files(report: dict, output_dir: str) -> dict:
     }
 
 
+def run_export_benchmarks(
+    args,
+    variant_models: dict[str, object],
+    benchmark_results: list[dict],
+    dataset: dict,
+    benchmark_inputs,
+) -> tuple[list[dict], list[dict]]:
+    exports = []
+    export_errors = []
+    benchmark_results_by_name = {result["name"]: result for result in benchmark_results}
+
+    for format_name in args.export_formats:
+        for source_variant in args.export_variants:
+            variant_model = variant_models.get(source_variant)
+            source_result = benchmark_results_by_name.get(source_variant)
+            if variant_model is None or source_result is None:
+                export_errors.append(
+                    {
+                        "format": format_name,
+                        "source_variant": source_variant,
+                        "error": "Source variant was not benchmarked successfully.",
+                    }
+                )
+                continue
+
+            artifact_path = None
+            try:
+                if format_name != "onnx":
+                    raise RuntimeError(f"Unsupported export format: {format_name}")
+
+                validate_export_variant_support(format_name, source_variant)
+                artifact_path = export_model_to_onnx(
+                    variant_model,
+                    benchmark_inputs,
+                    output_dir=args.output_dir,
+                    variant_name=source_variant,
+                    export_opset=args.export_opset,
+                )
+                inference_metrics = benchmark_onnx_runtime(
+                    artifact_path,
+                    benchmark_inputs,
+                    n_runs=args.n_runs,
+                    warmup_runs=args.warmup_runs,
+                )
+                targets, predictions = collect_onnx_predictions(
+                    artifact_path,
+                    dataset["test"],
+                    batch_size=int(benchmark_inputs.size(0)),
+                )
+                evaluation_metrics = compute_classification_metrics(
+                    targets,
+                    predictions,
+                    index_to_label=dataset["index_to_label"],
+                )
+                export_result = build_export_result(
+                    format_name=format_name,
+                    source_variant=source_variant,
+                    artifact_path=artifact_path,
+                    inference_metrics=inference_metrics,
+                    evaluation_metrics=evaluation_metrics,
+                    simulated=False,
+                )
+                exports.append(export_result)
+                print_export_summary(export_result)
+            except Exception as exc:
+                error = {
+                    "format": format_name,
+                    "source_variant": source_variant,
+                    "error": str(exc),
+                    "artifact_path": artifact_path,
+                }
+                export_errors.append(error)
+                print(f"[warn] Skipping export {format_name}:{source_variant}: {exc}\n")
+
+    return exports, export_errors
+
+
 def run_real_benchmark(args) -> dict:
     print("=== EdgeInfer: Quantization & Edge Inference Benchmark ===\n")
     torch.manual_seed(args.seed)
@@ -889,10 +1311,16 @@ def run_real_benchmark(args) -> dict:
     benchmark_inputs = benchmark_inputs[:max(1, min(args.batch_size, benchmark_inputs.size(0)))]
 
     results = []
+    variant_models = {}
     variant_errors = []
     for variant_name in args.variants:
         try:
-            variant_model = build_variant_model(model, variant_name)
+            variant_model = build_variant_model(
+                model,
+                variant_name,
+                calibration_dataset=dataset["calibration"],
+                calibration_batch_size=args.train_batch_size,
+            )
             inference_metrics = benchmark_inference(
                 variant_model,
                 benchmark_inputs,
@@ -912,6 +1340,7 @@ def run_real_benchmark(args) -> dict:
                 evaluation_metrics,
             )
             results.append(result)
+            variant_models[variant_name] = variant_model
             print_variant_summary(result)
         except Exception as exc:
             error = {"name": variant_name, "error": str(exc)}
@@ -920,6 +1349,14 @@ def run_real_benchmark(args) -> dict:
 
     if not results:
         raise RuntimeError("All benchmark variants failed.")
+
+    exports, export_errors = run_export_benchmarks(
+        args,
+        variant_models=variant_models,
+        benchmark_results=results,
+        dataset=dataset,
+        benchmark_inputs=benchmark_inputs,
+    )
 
     return {
         "mode": "benchmark",
@@ -930,8 +1367,10 @@ def run_real_benchmark(args) -> dict:
         "dataset": dataset_report_metadata(dataset),
         "training": training,
         "results": results,
+        "exports": exports,
         "summary": summarize_results(results),
         "variant_errors": variant_errors,
+        "export_errors": export_errors,
     }
 
 
@@ -1000,6 +1439,59 @@ def compare_reports(baseline_report: dict, candidate_report: dict) -> dict:
         "shared_variants": shared_variants,
         "variant_comparisons": comparisons,
     }
+
+
+def evaluate_regression_thresholds(comparison: dict, args) -> list[dict]:
+    regressions = []
+
+    for variant_name, diff in comparison["variant_comparisons"].items():
+        if args.max_latency_regression_pct is not None and diff["latency_change_pct"] is not None:
+            if diff["latency_change_pct"] > args.max_latency_regression_pct:
+                regressions.append(
+                    {
+                        "variant": variant_name,
+                        "metric": "latency_change_pct",
+                        "observed": diff["latency_change_pct"],
+                        "threshold": args.max_latency_regression_pct,
+                    }
+                )
+
+        if args.max_size_regression_pct is not None and diff["size_change_pct"] is not None:
+            if diff["size_change_pct"] > args.max_size_regression_pct:
+                regressions.append(
+                    {
+                        "variant": variant_name,
+                        "metric": "size_change_pct",
+                        "observed": diff["size_change_pct"],
+                        "threshold": args.max_size_regression_pct,
+                    }
+                )
+
+        if args.max_accuracy_drop is not None:
+            accuracy_drop = -diff["accuracy_delta"]
+            if accuracy_drop > args.max_accuracy_drop:
+                regressions.append(
+                    {
+                        "variant": variant_name,
+                        "metric": "accuracy_drop",
+                        "observed": round(accuracy_drop, 4),
+                        "threshold": args.max_accuracy_drop,
+                    }
+                )
+
+        if args.max_macro_f1_drop is not None:
+            macro_f1_drop = -diff["macro_f1_delta"]
+            if macro_f1_drop > args.max_macro_f1_drop:
+                regressions.append(
+                    {
+                        "variant": variant_name,
+                        "metric": "macro_f1_drop",
+                        "observed": round(macro_f1_drop, 4),
+                        "threshold": args.max_macro_f1_drop,
+                    }
+                )
+
+    return regressions
 
 
 def write_comparison_report(comparison: dict, output_path: str | None, output_dir: str) -> str:
@@ -1116,6 +1608,21 @@ def add_benchmark_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("--calibration-ratio", type=float, default=0.1, help="Calibration ratio for JSONL datasets.")
     parser.add_argument("--validation-ratio", type=float, default=0.1, help="Validation ratio for JSONL datasets.")
     parser.add_argument("--test-ratio", type=float, default=0.1, help="Test ratio for JSONL datasets.")
+    parser.add_argument(
+        "--export-formats",
+        nargs="+",
+        choices=EXPORT_FORMATS,
+        default=[],
+        help="Optional export/runtime benchmarks to run after eager benchmarking.",
+    )
+    parser.add_argument(
+        "--export-variants",
+        nargs="+",
+        choices=DEFAULT_VARIANTS,
+        default=["fp32"],
+        help="Variant(s) to export and benchmark in the requested export format(s).",
+    )
+    parser.add_argument("--export-opset", type=int, default=17, help="ONNX opset version for exported models.")
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -1143,6 +1650,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     compare_parser.add_argument("--output-dir", default="reports", help="Directory containing benchmark reports.")
     compare_parser.add_argument("--output", help="Optional path for a saved comparison JSON report.")
+    compare_parser.add_argument("--max-latency-regression-pct", type=float, help="Fail if latency increases by more than this percentage.")
+    compare_parser.add_argument("--max-size-regression-pct", type=float, help="Fail if model size increases by more than this percentage.")
+    compare_parser.add_argument("--max-accuracy-drop", type=float, help="Fail if accuracy drops by more than this absolute amount.")
+    compare_parser.add_argument("--max-macro-f1-drop", type=float, help="Fail if macro F1 drops by more than this absolute amount.")
 
     history_parser = subparsers.add_parser(
         "history",
@@ -1189,6 +1700,26 @@ def validate_benchmark_args(args):
             raise SystemExit("JSONL split ratios must be non-negative.")
         if args.calibration_ratio + args.validation_ratio + args.test_ratio >= 1:
             raise SystemExit("JSONL split ratios must sum to less than 1.")
+    if args.export_opset < 11:
+        raise SystemExit("--export-opset must be at least 11.")
+    if args.export_formats:
+        missing_export_variants = sorted(set(args.export_variants) - set(args.variants))
+        if missing_export_variants:
+            raise SystemExit(
+                "Export variants must also be benchmarked variants. Missing from --variants: "
+                + ", ".join(missing_export_variants)
+            )
+        if "onnx" in args.export_formats:
+            unsupported_onnx_variants = sorted(
+                set(args.export_variants) - set(ONNX_SUPPORTED_EXPORT_VARIANTS)
+            )
+            if unsupported_onnx_variants:
+                raise SystemExit(
+                    "ONNX export currently supports only these variants for this transformer benchmark: "
+                    + ", ".join(ONNX_SUPPORTED_EXPORT_VARIANTS)
+                    + ". Unsupported export variant(s): "
+                    + ", ".join(unsupported_onnx_variants)
+                )
     if not TORCH_AVAILABLE and not args.simulate:
         raise SystemExit(
             "PyTorch is required for real benchmarks. Install it or rerun with --simulate "
@@ -1219,15 +1750,27 @@ def run_compare_command(args) -> int:
     comparison = compare_reports(baseline_report, candidate_report)
     comparison["baseline_path"] = str(Path(baseline_path).resolve())
     comparison["candidate_path"] = str(Path(candidate_path).resolve())
+    comparison["regressions"] = evaluate_regression_thresholds(comparison, args)
 
     print_comparison_summary(comparison)
     saved_path = write_comparison_report(comparison, args.output, args.output_dir)
     print("[ Comparison Artifact ]")
     print(f"  JSON: {saved_path}\n")
 
+    exit_code = 0
+    if comparison["regressions"]:
+        exit_code = 2
+        print("[ Regression Gates ]")
+        for regression in comparison["regressions"]:
+            print(
+                f"  {regression['variant']} {regression['metric']}: "
+                f"observed={regression['observed']} threshold={regression['threshold']}"
+            )
+        print()
+
     print("[ JSON output ]")
     print(json.dumps(comparison, indent=2))
-    return 0
+    return exit_code
 
 
 def run_history_command(args) -> int:
@@ -1244,6 +1787,16 @@ def run_history_command(args) -> int:
 def run_benchmark_command(args) -> int:
     validate_benchmark_args(args)
     report = build_simulation_report(args) if args.simulate else run_real_benchmark(args)
+
+    if report.get("exports"):
+        print("[ Export Benchmarks ]")
+        for export_result in report["exports"]:
+            print_export_summary(export_result)
+    for export_error in report.get("export_errors", []):
+        print(
+            f"[warn] Export error {export_error['format']}:{export_error['source_variant']}: "
+            f"{export_error['error']}"
+        )
 
     if not args.skip_report:
         report["artifacts"] = write_report_files(report, args.output_dir)
@@ -1276,6 +1829,8 @@ def run_benchmark_command(args) -> int:
                 "summary": report["summary"],
                 "artifacts": report.get("artifacts"),
                 "variant_errors": report["variant_errors"],
+                "exports": report.get("exports", []),
+                "export_errors": report.get("export_errors", []),
             },
             indent=2,
         )
