@@ -4,10 +4,12 @@ EdgeInfer is a CPU-first benchmarking tool for small text classifiers, focused o
 
 It now does more than print a toy before/after comparison:
 
-- trains a compact transformer before benchmarking, so accuracy is meaningful
+- trains a compact transformer before benchmarking, so quality metrics are meaningful
+- uses separate train, calibration, validation, and test splits
 - benchmarks multiple deployment variants: `fp32`, `dynamic_int8`, and `dynamic_float16`
+- reports accuracy, macro F1, weighted F1, balanced accuracy, and confusion matrices
 - saves JSON and CSV reports for each run
-- supports either a built-in learnable dataset or a user-provided JSONL text dataset
+- compares saved runs and shows local report history
 - requires explicit `--simulate` mode when PyTorch is unavailable, so fake metrics are clearly labeled
 
 ## Motivation
@@ -17,11 +19,13 @@ Deploying AI in bandwidth-limited, power-constrained environments requires model
 ## What It Does
 
 1. Builds and trains a small transformer text classifier
-2. Evaluates baseline FP32 accuracy
-3. Benchmarks repeated CPU inference with warmup runs
-4. Applies dynamic quantization variants
-5. Re-benchmarks latency, throughput, model size, and accuracy deltas
-6. Writes machine-readable JSON and CSV artifacts to `reports/`
+2. Splits data into train, calibration, validation, and test sets
+3. Evaluates validation metrics during training
+4. Benchmarks repeated CPU inference with warmup runs
+5. Applies dynamic quantization variants
+6. Re-benchmarks latency, throughput, size, and held-out test metrics
+7. Writes machine-readable JSON and CSV artifacts to `reports/`
+8. Compares past benchmark runs with built-in CLI commands
 
 ## Installation
 
@@ -29,7 +33,7 @@ Deploying AI in bandwidth-limited, power-constrained environments requires model
 pip install torch
 ```
 
-## Usage
+## Benchmark Usage
 
 Run the default built-in dataset benchmark:
 
@@ -73,21 +77,48 @@ Expected JSONL format:
 {"text": "screen flickers after boot", "label": 0}
 ```
 
+## Compare And History
+
+Compare the latest two saved benchmark runs:
+
+```bash
+python edge_infer.py compare --latest
+```
+
+Compare two explicit report files:
+
+```bash
+python edge_infer.py compare \
+  --baseline reports/edgeinfer_20260329_120000_000001.json \
+  --candidate reports/edgeinfer_20260329_121500_000002.json
+```
+
+List recent reports:
+
+```bash
+python edge_infer.py history --limit 5
+```
+
 ## Output Artifacts
 
-Each run writes:
+Each benchmark run writes:
 
 - `reports/edgeinfer_<timestamp>.json`
 - `reports/edgeinfer_<timestamp>.csv`
 
-The report includes:
+Each comparison run writes:
+
+- `reports/edgeinfer_compare_<timestamp>.json`
+
+Benchmark reports include:
 
 - runtime mode (`benchmark` or `simulation`)
 - system metadata
 - config values
-- dataset summary
+- dataset summary and split counts
 - training history
-- per-variant latency, throughput, size, and accuracy
+- per-variant latency, throughput, size, and quality metrics
+- confusion matrices and per-class scores
 - comparison summaries versus FP32
 
 ## Example Console Flow
@@ -96,25 +127,29 @@ The report includes:
 === EdgeInfer: Quantization & Edge Inference Benchmark ===
 
 [ Dataset ] keyword_signal
-  Train examples: 512
-  Eval examples:  128
+  Train examples:       512
+  Calibration examples: 64
+  Validation examples:  128
+  Test examples:        128
 
 [ Training ]
-  Epoch 1: loss=0.4120 eval_acc=92.2%
-  Epoch 2: loss=0.1337 eval_acc=98.4%
-  Epoch 3: loss=0.0518 eval_acc=99.2%
+  Epoch 1: loss=0.4120 val_acc=92.2% val_macro_f1=92.1%
+  Epoch 2: loss=0.1337 val_acc=98.4% val_macro_f1=98.4%
+  Epoch 3: loss=0.0518 val_acc=99.2% val_macro_f1=99.2%
 
 [ fp32 ]
   Size:     0.56 MB
   Latency:  4.31 ms mean, 4.07 ms median, 5.14 ms p95
   Throughput: 231.92 samples/s
-  Accuracy: 99.2%
+  Quality:  acc=99.2%, macro_f1=99.2%, weighted_f1=99.2%
 ```
 
 ## Useful Flags
 
 - `--simulate`: run demo metrics intentionally and transparently
 - `--dataset-jsonl PATH`: benchmark on a local labeled text dataset
+- `--calibration-ratio`, `--validation-ratio`, `--test-ratio`: JSONL split controls
+- `--calibration-samples`, `--validation-samples`, `--test-samples`: built-in dataset split sizes
 - `--variants ...`: choose which deployment variants to compare
 - `--output-dir DIR`: choose where reports are saved
 - `--skip-report`: skip writing JSON/CSV artifacts
@@ -122,11 +157,11 @@ The report includes:
 
 ## Extending
 
-- Add static post-training quantization with a calibration split
+- Add static post-training quantization using the new calibration split
 - Support ONNX export for hardware-agnostic deployment
 - Swap the local tokenizer/model for a real fine-tuned checkpoint
 - Add pruning or sparsity-aware comparisons
-- Add CI or dashboards to compare benchmark history across runs
+- Add CI regression thresholds for benchmark artifacts
 
 ## Tech Stack
 
